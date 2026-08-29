@@ -1,0 +1,12 @@
+listen = "0.0.0.0"
+port = 80
+wwwroot = "./www"
+dir_listing = true
+max_listing = 50000
+
+mmap_send = true
+mmap_window_mb = 8
+mmap_budget_mb = 512
+
+[auth]
+mode = "none"

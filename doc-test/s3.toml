@@ -1,0 +1,12 @@
+listen = "0.0.0.0"
+port = 8080
+wwwroot = "./www"
+dir_listing = true
+require_auth_write = true
+
+[auth]
+mode = "basic"
+users = { "admin" = "S3cret!pass" }
+
+max_upload_size = 1073741824
+sync_on_upload = false

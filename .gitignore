@@ -1,0 +1,29 @@
+# ---- 构建产物（不入库，由 CI 在 release 时编译）----
+/target/
+/bin/
+
+# ---- 本地测试证书（自签，首次运行测试脚本时自动生成）----
+/test-cert.pem
+/test-key.pem
+
+# ---- 测试运行时产物 ----
+/.t/
+*.log
+pid-*
+.t421.pid
+.t421.toml
+nohup.out
+
+# www/ 下运行时生成或过大的测试数据
+/www/*.bin
+/www/up/
+/www/newdir/
+/www/default/
+/www/rootonly.txt
+/www/dirtest
+/www/README.md
+
+# 编辑器 / 系统文件
+*.swp
+*.swo
+.DS_Store

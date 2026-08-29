@@ -1,0 +1,48 @@
+# rfs 端到端测试配置
+listen = "127.0.0.1"
+port = 18080
+wwwroot = "./www"
+serve_dotfiles = false
+
+# ---------- TLS（用于 HTTPS/HTTP2/HTTP3 测试） ----------
+tls_cert = "./test-cert.pem"
+tls_key  = "./test-key.pem"
+
+enable_h3 = true
+h3_port = 18443
+
+[auth]
+mode = "bearer"
+tokens = ["test-token-123"]
+
+require_auth_write = true
+dir_listing = true
+index_files = ["index.html"]
+max_upload_size = 5242880
+mkdir_on_upload = true
+sync_on_upload = false
+
+max_conn = 64
+body_idle_timeout = 30
+io_chunk_size = 65536
+max_listing = 5000
+
+[security]
+csrf = true
+frame_deny = true
+nosniff = true
+hsts = true
+hsts_age = 31536000
+csp = true
+referrer_policy = true
+
+[vhosts."vhost.local"]
+wwwroot = "./www-vhost"
+dir_listing = false
+[vhosts."vhost.local".auth]
+mode = "basic"
+users = { "alice" = "wonderland" }
+
+log_level = "info"
+access_log = true
+auto_reload = true

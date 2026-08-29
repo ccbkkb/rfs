@@ -1,0 +1,14 @@
+listen = "0.0.0.0"
+port = 443
+wwwroot = "./www"
+tls_cert = "./test-cert.pem"
+tls_key  = "./test-key.pem"
+enable_h3 = true
+h3_port = 443
+
+[auth]
+mode = "bearer"
+tokens = ["9f86d081884c7d65"]
+
+[security]
+hsts_age = 63072000

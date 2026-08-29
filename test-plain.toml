@@ -1,0 +1,29 @@
+# rfs v0.3.0 新功能测试配置：自定义头 + 错误页 + default 回落
+listen = "127.0.0.1"
+port = 18080
+wwwroot = "./www"
+require_auth_write = true
+dir_listing = true
+index_files = ["index.html"]
+max_upload_size = 5242880
+access_log = true
+auto_reload = false
+custom_headers = { "X-CDN-TTL" = "300", "Cache-Control" = "public, max-age=86400", "Access-Control-Allow-Origin" = "*" }
+
+[auth]
+mode = "bearer"
+tokens = ["test-token-123"]
+
+[error_pages]
+"404" = "err404.html"
+"5xx" = "err5xx.html"
+
+[vhosts."vhost.local"]
+wwwroot = "./www-vhost"
+dir_listing = false
+[vhosts."vhost.local".auth]
+mode = "basic"
+users = { "alice" = "wonderland" }
+[vhosts."vhost.local".custom_headers]
+"Cache-Control" = "no-store, vhost-override"
+"X-Vhost" = "vhost.local"

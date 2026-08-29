@@ -1,0 +1,12 @@
+listen = "0.0.0.0"
+port = 80
+wwwroot = "./www"
+serve_dotfiles = false
+dir_listing = false
+
+[security]
+hide_version = true
+frame_deny = true
+nosniff = true
+csp = true
+csrf = true

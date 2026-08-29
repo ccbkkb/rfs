@@ -1,0 +1,22 @@
+# rfs v0.3.0 TLS 测试：force_https + 自定义头 + 错误页
+listen = "127.0.0.1"
+port = 18443
+wwwroot = "./www"
+dir_listing = false
+require_auth_write = true
+access_log = true
+auto_reload = false
+
+tls_cert = "./test-cert.pem"
+tls_key  = "./test-key.pem"
+enable_h3 = true
+h3_port = 19443
+force_https = true
+custom_headers = { "X-CDN-TTL" = "600" }
+
+[auth]
+mode = "bearer"
+tokens = ["test-token-123"]
+
+[error_pages]
+"default" = "err404.html"

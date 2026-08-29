@@ -1,0 +1,17 @@
+listen = "0.0.0.0"
+port = 80
+wwwroot = "./www"
+dir_listing = true
+
+[vhosts."static.example.com"]
+wwwroot = "./www"
+dir_listing = false
+index_files = ["index.html"]
+
+[vhosts."dl.example.com"]
+wwwroot = "./www"
+max_upload_size = 2147483648
+[vhosts."dl.example.com".auth]
+mode = "any"
+tokens = ["dl-token-1"]
+users = { "ops" = "pass" }
