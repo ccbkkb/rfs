@@ -309,6 +309,20 @@ pub async fn process<B: ReadBody + 'static, R: Responder>(
         let path_ct = if rel.is_empty() { "/".to_string() } else { format!("/{rel}") };
         for route in site.routes.iter() {
             if route.match_rest(&path_ct).is_some() {
+                // 方法白名单：CONNECT/TRACE 等一律拒绝（CONNECT 不在 is_mutating 中、会绕过写鉴权；TRACE 可能回显注入头）
+                if !matches!(
+                    ctx.method.as_str(),
+                    "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+                ) {
+                    let mut out = vec![(
+                        "allow".into(),
+                        "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".into(),
+                    )];
+                    sec_headers(cfg, ctx.tls, &mut out);
+                    resp.headers(405, out).await.map_err(|_| ())?;
+                    resp.finish().await.map_err(|_| ())?;
+                    return Ok(Outcome::default());
+                }
                 return crate::proxy::forward(material, site, route, &rel, ctx, body_in.take(), resp).await;
             }
         }

@@ -310,11 +310,13 @@ pub async fn forward<B: ReadBody + 'static, R: Responder>(
     };
 
     let mut reqb = Request::builder().method(method.clone()).uri(uri);
-    {
-        let hm = reqb.headers_mut().expect("builder 有 headers");
-        for (k, v) in headers.iter() {
-            hm.append(k, v.clone());
+    match reqb.headers_mut() {
+        Some(hm) => {
+            for (k, v) in headers.iter() {
+                hm.append(k, v.clone());
+            }
         }
+        None => return gateway_error(cfg, resp, 500, "请求构造失败", ctx).await,
     }
     let req = match reqb.body(out_body) {
         Ok(r) => r,

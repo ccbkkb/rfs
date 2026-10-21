@@ -186,7 +186,9 @@ impl RateLimiter {
             if g.is_none() {
                 *g = Some(RedisConn::connect(&cfg.redis_addr).await?);
             }
-            let c = g.as_mut().expect("redis 连接已建立");
+            let Some(c) = g.as_mut() else {
+                return Err("redis 连接不可用".to_string());
+            };
             match c.cmd_int(&["INCR", &rkey]).await {
                 Ok(n) => {
                     if n == 1 {
@@ -339,6 +341,8 @@ impl RedisConn {
                 let n: i64 = line.trim().parse().unwrap_or(-1);
                 if n < 0 {
                     Ok(0)
+                } else if n > 16 * 1024 {
+                    Err("redis 响应过大（>16KiB）".to_string())
                 } else {
                     let mut buf = vec![0u8; n as usize + 2];
                     self.stream
