@@ -14,6 +14,9 @@
 | 安全 | 防跨站（CSRF：写方法校验 Origin / Sec-Fetch-Site）、防目录穿越（%2e%2e、`..`、NUL）、防符号链接逃逸、隐藏点文件、`X-Frame-Options`、`nosniff`、`CSP`、`HSTS`、`Referrer-Policy` |
 | 配置 | TOML 启动读取；`SIGHUP` 热重载（失败保留旧配置）；可选 `auto_reload` 秒级自动重载 |
 | 抗 OOM | 全链路流式（64KiB 块）、上传先落临时文件、目录列表条目上限、并发连接信号量、请求体空闲超时、头读取超时（防慢速攻击） |
+| 反向代理 (v0.4) | 前缀路由 → http/https 上游；请求/响应双向流式；逐跳头剥离；XFF 防伪造；头注入/移除；连接 5s、整体超时可配 |
+| 伪静态/重写 (v0.4) | 正则重写（rust regex 线性时间，无 ReDoS）→ 内部重写或 301/302/307/308；结果强制内部路径（防开放重定向）；重写链最多 8 跳 |
+| 速率限制 (v0.4) | 令牌桶；默认文件持久化（重启保留），可选 Redis 固定窗口；IPv6 /64 聚合；429 + Retry-After；桶表有硬上限（防 OOM） |
 | 低调空闲 | 纯事件驱动异步运行时，空闲时不轮询不忙等 |
 
 ## 快速开始
@@ -58,6 +61,44 @@ dir_listing = false
 - `kill -HUP <pid>` → 热重载配置与 TLS 证书（原子切换，校验失败保留旧配置）
 - `kill -TERM <pid>` / `Ctrl-C` → 优雅退出（等在途请求最多 5 秒）
 - 配置 `auto_reload = true` 后，改配置保存即自动生效（1 秒轮询 mtime，开销可忽略）
+
+## 反向代理 / 伪静态 / 限速（v0.4 新增）
+
+```toml
+# 前缀路由 → 上游（http/https）
+[[routes]]
+prefix = "/api/"                  # 路径段对齐（/api 不会误配 /api2）
+upstream = "http://127.0.0.1:9000"
+strip_prefix = true               # 去掉 /api/ 再拼上游
+timeout = 30                      # 上游超时（秒）
+xff = "set"                       # set | append | off
+preserve_host = true              # 保留原始 Host 传给上游
+# tls_verify = false              # 仅自签内网后端；默认 true
+set_request_headers  = { "x-injected" = "yes" }
+set_response_headers = { "x-proxied" = "1" }
+remove_response_headers = ["set-cookie"]
+
+# 伪静态：正则重写（$1 捕获引用）
+[[rewrites]]
+pattern = '^/p/(\d+)$'
+replace = "/api/p/$1"             # 内部重写（可链式命中路由）
+[[rewrites]]
+pattern = '^/old$'
+replace = "/new"
+redirect = 302                    # 对外跳转；0 = 内部重写
+
+# 速率限制（rate/burst 可在 vhost 覆盖；storage 仅全局）
+[ratelimit]
+rate = 20.0                       # 每秒补充令牌
+burst = 40.0                      # 桶容量（突发上限）
+storage = "file"                  # file | redis
+file = "./rfs-rate.db"
+flush_secs = 10
+fail_open = true                  # 后端故障时放行（false = 拒绝）
+max_entries = 65536               # 内存桶表上限（防 OOM）
+```
+
+安全要点：上游地址只来自配置（非请求参数，无 SSRF 面）；转发路径重建并做 URI 安全编码；`..` 先归一化再转发；剥离全部逐跳头；XFF 可覆盖防伪造；重写/跳转结果必须是内部路径；全链路流式 + 有界通道（内存与请求大小无关）；代理写请求同样遵循 `require_auth_write` 与站点鉴权。
 
 ## API 用法（curl 示例）
 
@@ -104,7 +145,8 @@ curl http://127.0.0.1:8080/iso/
 ## 与 nginx 的对比定位
 
 - 部署即用：`rfs -c rfs.toml` 一条命令，无 master/worker 进程管理成本。
-- 需要的功能（静态、上传、鉴权、虚拟主机、TLS、H3）全都内置；不需要的（rewrite、proxy、lua……）一概不带，攻击面更小。
+- 需要的功能（静态、上传、鉴权、虚拟主机、TLS、H3）全都内置；v0.4 起另含 **反向代理 / 伪静态 / 限速**（默认不启用，需显式配置），仍不包含 lua 等复杂模块体系。
+- **最小攻击面说明**：纯静态场景可继续使用 v0.3.1（commit `7b5014a`，无 proxy/rewrite/限速代码）；v0.4 在未配置 routes/rewrites/ratelimit 时行为与 v0.3.1 等价，但相关代码与依赖会一并编译进二进制。
 - 轻量到可以在手机 / 树莓派 / 路由器上跑；空闲内存占用远低于 nginx + OpenSSL 进程组。
 
 ## 📖 配置文档
@@ -146,8 +188,9 @@ src/
 ## 测试
 
 ```bash
-cargo test          # 单元测试（路径归一化 / Range 解析）
-sh e2e.sh           # 端到端测试（明文 + TLS/H3 双实例，42 项断言）
+cargo test          # 单元测试（路径归一化 / Range / 路由 / 限速）
+sh runsrv.sh start && sh e2e.sh     # 端到端（明文 + TLS/H3 双实例，42 项断言）
+sh e2e-proxy.sh                     # 反代 / 伪静态 / 限速（27 项断言）
 ```
 
 实测结果（Android/Termux, aarch64）：

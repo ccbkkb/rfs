@@ -1,0 +1,18 @@
+# 限速测试配置（端口 18082）：令牌桶 rate=1/s burst=2；文件持久化
+listen = "127.0.0.1"
+port = 18082
+wwwroot = "./www"
+
+[auth]
+mode = "none"
+
+[ratelimit]
+rate = 1.0
+burst = 2.0
+storage = "file"
+file = "./.t/rl-test.db"
+flush_secs = 1
+max_entries = 4096
+
+log_level = "info"
+access_log = true

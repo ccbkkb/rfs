@@ -24,6 +24,8 @@ pub struct Material {
     pub custom_global: Arc<Vec<(String, String)>>,
     /// 预读入内存的自定义错误页："404"/"4xx"/"5xx"/"default" -> (内容, Content-Type)
     pub error_page_bodies: std::collections::HashMap<String, (Bytes, String)>,
+    /// 进程级限速器（跨热重载保留桶状态）
+    pub ratelimit: Arc<crate::ratelimit::RateLimiter>,
 }
 
 impl Material {
@@ -71,11 +73,13 @@ impl Material {
         };
 
         let mut default_site = crate::config::Site::resolve(&cfg, None).1;
+        crate::config::attach_extras(&mut default_site, &cfg, None)?;
         default_site.root = canonicalize_root(&cfg.wwwroot)?;
 
         let mut sites = std::collections::HashMap::new();
         for host in cfg.vhosts.keys() {
             let (name, mut site) = crate::config::Site::resolve(&cfg, Some(host));
+            crate::config::attach_extras(&mut site, &cfg, Some(host))?;
             let root = site
                 .root
                 .to_str()
@@ -96,6 +100,7 @@ impl Material {
             std::fs::read_dir(&canon)
                 .with_context(|| format!("回落目录 {} 不可读", canon.display()))?;
             let mut s = crate::config::Site::resolve(&cfg, None).1;
+            crate::config::attach_extras(&mut s, &cfg, None)?;
             s.root = canon;
             Some(Arc::new(s))
         };
@@ -121,6 +126,7 @@ impl Material {
         }
 
         let custom_global = Arc::new(cfg.custom_headers.clone().into_iter().collect());
+        let ratelimit = crate::ratelimit::global(&cfg);
 
         Ok(Material {
             cfg,
@@ -131,6 +137,7 @@ impl Material {
             force_https,
             custom_global,
             error_page_bodies,
+            ratelimit,
         })
     }
 }

@@ -10,6 +10,8 @@ mod h3srv;
 mod httpd;
 mod log;
 mod material;
+mod proxy;
+mod ratelimit;
 
 use arc_swap::ArcSwap;
 use config::{Config, DEFAULT_CONFIG};
@@ -264,7 +266,7 @@ async fn main() {
     if args.check {
         let m = material.load_full();
         println!(
-            "配置校验通过: {}\n  HTTP: {}:{}  wwwroot={}  TLS={}  H3={}  vhosts={}\n  max_conn={} chunk={} legs={} auth={} csrf={}",
+            "配置校验通过: {}\n  HTTP: {}:{}  wwwroot={}  TLS={}  H3={}  vhosts={}\n  max_conn={} chunk={} legs={} auth={} csrf={} routes={} rewrites={} rl={}",
             args.config_path,
             m.cfg.listen,
             m.cfg.port,
@@ -276,7 +278,10 @@ async fn main() {
             m.cfg.io_chunk_size,
             m.cfg.max_listing,
             m.cfg.auth.mode,
-            m.cfg.security.csrf
+            m.cfg.security.csrf,
+            m.cfg.routes.len(),
+            m.cfg.rewrites.len(),
+            m.cfg.ratelimit.storage
         );
         return;
     }

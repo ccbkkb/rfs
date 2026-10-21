@@ -1,0 +1,48 @@
+# 反代/伪静态/客户端-服务端头注入 测试配置（端口 18081）
+listen = "127.0.0.1"
+port = 18081
+wwwroot = "./www"
+require_auth_write = false
+
+[auth]
+mode = "none"
+
+# ① 前缀剥离 + 请求头注入 + 响应头处理
+[[routes]]
+prefix = "/api/"
+upstream = "http://127.0.0.1:19000"
+strip_prefix = true
+xff = "set"
+set_request_headers = { "x-injected" = "yes" }
+set_response_headers = { "x-proxied" = "1" }
+remove_response_headers = ["x-upstream-secret"]
+
+# ② 不剥离前缀（保持原始路径）
+[[routes]]
+prefix = "/keep"
+upstream = "http://127.0.0.1:19000"
+
+# ③ HTTPS 上游（自签证书，显式关闭校验——仅测试用）
+[[routes]]
+prefix = "/sec/"
+upstream = "https://127.0.0.1:19444"
+strip_prefix = true
+tls_verify = false
+
+# 伪静态：内部重写链（先改写，再命中 /api/ 路由）
+[[rewrites]]
+pattern = '^/p/(\d+)$'
+replace = "/api/p/$1"
+
+[[rewrites]]
+pattern = '^/legacy/([A-Za-z0-9_]+)\.html$'
+replace = "/api/legacy/$1"
+
+# 伪静态：对外跳转
+[[rewrites]]
+pattern = '^/old$'
+replace = "/new"
+redirect = 302
+
+log_level = "info"
+access_log = true

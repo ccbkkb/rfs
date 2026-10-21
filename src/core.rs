@@ -81,6 +81,8 @@ pub struct RequestCtx {
     pub target: String,
     pub host: Option<String>,
     pub headers: HeaderMap,
+    /// 对端 IP（HTTP/1.x、H3 均提供；用于限速与转发头）
+    pub peer_ip: Option<std::net::IpAddr>,
     pub tls: bool,
 }
 
@@ -91,7 +93,7 @@ pub struct Outcome {
 
 // ---------------- 安全头 ----------------
 
-fn sec_headers(cfg: &Config, tls: bool, out: &mut Vec<(String, String)>) {
+pub(crate) fn sec_headers(cfg: &Config, tls: bool, out: &mut Vec<(String, String)>) {
     let s = &cfg.security;
     if s.frame_deny {
         out.push(("x-frame-options".into(), "DENY".into()));
@@ -148,13 +150,14 @@ fn csrf_check(cfg: &Config, ctx: &RequestCtx) -> Result<(), FsError> {
 
 // ---------------- 主处理 ----------------
 
-pub async fn process<B: ReadBody, R: Responder>(
+pub async fn process<B: ReadBody + 'static, R: Responder>(
     material: &crate::material::Material,
     ctx: &RequestCtx,
-    body_in: Option<&mut B>,
+    body_in: Option<B>,
     resp: &mut R,
 ) -> Result<Outcome, ()> {
     let cfg = &material.cfg;
+    let mut body_in = body_in;
 
     // 强制 HTTPS：TLS 开启时，同端口的明文 HTTP 请求 301 跳转到 https://
     if material.force_https && !ctx.tls {
@@ -227,6 +230,23 @@ pub async fn process<B: ReadBody, R: Responder>(
     };
     let site = &*site;
 
+    // 速率限制（在鉴权前执行，抵御口令爆破与枚举；429 带 Retry-After）
+    if let Some(policy) = &site.ratelimit {
+        if let Err(retry) = material.ratelimit.check(policy, ctx.peer_ip).await {
+            let body = Bytes::from_static(b"429 Too Many Requests\n");
+            let mut out = vec![
+                ("content-type".into(), "text/plain; charset=utf-8".into()),
+                ("content-length".into(), body.len().to_string()),
+                ("retry-after".into(), retry.to_string()),
+            ];
+            sec_headers(cfg, ctx.tls, &mut out);
+            resp.headers(429, out).await.map_err(|_| ())?;
+            resp.send_body(body.clone()).await.map_err(|_| ())?;
+            resp.finish().await.map_err(|_| ())?;
+            return Ok(Outcome { bytes_sent: body.len() as u64 });
+        }
+    }
+
     // 鉴权：写操作强制鉴权（require_auth_write）或站点配置了鉴权时，所有请求都要验
     let need_auth = (is_mutating(&ctx.method) && site.require_auth_write)
         || !matches!(site.auth, crate::config::AuthPolicy::None);
@@ -238,10 +258,75 @@ pub async fn process<B: ReadBody, R: Responder>(
     }
 
     // 路径归一化（防目录穿越）
-    let rel = match fsops::normalize_path(&ctx.raw_path) {
+    let mut rel = match fsops::normalize_path(&ctx.raw_path) {
         Ok(r) => r,
         Err(e) => return send_error(material, resp, e, ctx).await,
     };
+
+    // 伪静态/重写（内部重写可链式，最多 8 跳；结果必须是合法内部路径）
+    if !site.rewrites.is_empty() {
+        for _ in 0..8 {
+            let path_ct = if rel.is_empty() { "/".to_string() } else { format!("/{rel}") };
+            let mut changed = false;
+            for rw in site.rewrites.iter() {
+                if let Some(newp) = rw.apply(&path_ct) {
+                    if !newp.starts_with('/') || newp.starts_with("//") {
+                        return send_error(material, resp, FsError::Forbidden("重写结果非法".into()), ctx).await;
+                    }
+                    let inner = match fsops::normalize_path(&newp) {
+                        Ok(x) => x,
+                        Err(_) => return send_error(material, resp, FsError::Forbidden("重写结果非法".into()), ctx).await,
+                    };
+                    if rw.redirect != 0 {
+                        let q = if rw.keep_query {
+                            ctx.target.split_once('?').map(|(_, q)| format!("?{q}")).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let loc = format!("/{}{}", crate::proxy::encode_path(&inner), q);
+                        let mut out = vec![
+                            ("location".into(), loc),
+                            ("content-length".into(), "0".into()),
+                        ];
+                        sec_headers(cfg, ctx.tls, &mut out);
+                        resp.headers(rw.redirect, out).await.map_err(|_| ())?;
+                        resp.finish().await.map_err(|_| ())?;
+                        return Ok(Outcome::default());
+                    }
+                    rel = inner;
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    // 反向代理路由（先于静态处理；不适用点文件策略，因为没有本地文件访问）
+    if !site.routes.is_empty() {
+        let path_ct = if rel.is_empty() { "/".to_string() } else { format!("/{rel}") };
+        for route in site.routes.iter() {
+            if route.match_rest(&path_ct).is_some() {
+                // 方法白名单：CONNECT/TRACE 等一律拒绝（CONNECT 不在 is_mutating 中、会绕过写鉴权；TRACE 可能回显注入头）
+                if !matches!(
+                    ctx.method.as_str(),
+                    "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+                ) {
+                    let mut out = vec![(
+                        "allow".into(),
+                        "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS".into(),
+                    )];
+                    sec_headers(cfg, ctx.tls, &mut out);
+                    resp.headers(405, out).await.map_err(|_| ())?;
+                    resp.finish().await.map_err(|_| ())?;
+                    return Ok(Outcome::default());
+                }
+                return crate::proxy::forward(material, site, route, &rel, ctx, body_in.take(), resp).await;
+            }
+        }
+    }
 
     // 隐藏点文件
     if !site.serve_dotfiles {
@@ -269,7 +354,7 @@ pub async fn process<B: ReadBody, R: Responder>(
     match m.as_str() {
         "GET" => do_get(material, cfg, &site, &rel, &path, ctx, resp, false).await,
         "HEAD" => do_get(material, cfg, &site, &rel, &path, ctx, resp, true).await,
-        "PUT" => do_put(material, cfg, &site, &path, body_in, resp, ctx).await,
+        "PUT" => do_put(material, cfg, &site, &path, body_in.as_mut(), resp, ctx).await,
         "DELETE" => do_delete(material, cfg, &site, &path, ctx, resp).await,
         "MOVE" => do_move(material, cfg, &site, &path, ctx, resp).await,
         "OPTIONS" => {
