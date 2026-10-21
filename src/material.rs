@@ -26,6 +26,10 @@ pub struct Material {
     pub error_page_bodies: std::collections::HashMap<String, (Bytes, String)>,
     /// 进程级限速器（跨热重载保留桶状态）
     pub ratelimit: Arc<crate::ratelimit::RateLimiter>,
+    /// 应用层防护（每 IP 连接限制 / 违规封禁）
+    pub defense: Arc<crate::defense::Defense>,
+    /// 小文件内存缓存
+    pub small_cache: Arc<crate::cache::SmallFileCache>,
 }
 
 impl Material {
@@ -127,6 +131,11 @@ impl Material {
 
         let custom_global = Arc::new(cfg.custom_headers.clone().into_iter().collect());
         let ratelimit = crate::ratelimit::global(&cfg);
+        let defense = Arc::new(crate::defense::Defense::new(cfg.defense.clone()));
+        let small_cache = Arc::new(crate::cache::SmallFileCache::new(
+            cfg.small_cache_mb,
+            cfg.small_cache_max_kb,
+        ));
 
         Ok(Material {
             cfg,
@@ -138,6 +147,8 @@ impl Material {
             custom_global,
             error_page_bodies,
             ratelimit,
+            defense,
+            small_cache,
         })
     }
 }

@@ -252,6 +252,44 @@ impl Default for RateLimitCfg {
     }
 }
 
+fn default_small_cache_max_kb() -> usize {
+    64
+}
+
+/// 应用层防护（DDoS/CC/长连接/路径穿越爆破）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DefenseCfg {
+    /// 总开关（默认开）
+    pub enable: bool,
+    /// 每 IP 最大并发连接（0=不限）
+    pub max_conn_per_ip: usize,
+    /// 窗口内违规次数达到该值 → 临时封禁
+    pub max_violations: usize,
+    /// 违规统计窗口（秒）
+    pub violation_window_secs: u64,
+    /// 封禁时长（秒）
+    pub ban_secs: u64,
+    /// HTTP/1 头部读取缓冲上限（KiB），防超大头部攻击
+    pub max_header_kb: usize,
+    /// 单连接最大请求数（超出后返回 Connection: close；0=不限）
+    pub max_requests_per_conn: usize,
+}
+
+impl Default for DefenseCfg {
+    fn default() -> Self {
+        DefenseCfg {
+            enable: true,
+            max_conn_per_ip: 96,
+            max_violations: 30,
+            violation_window_secs: 60,
+            ban_secs: 300,
+            max_header_kb: 64,
+            max_requests_per_conn: 1000,
+        }
+    }
+}
+
 fn header_name_ok(k: &str) -> bool {
     !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
@@ -439,6 +477,18 @@ pub struct Config {
     /// 速率限制（全局默认 + 存储后端设置）
     #[serde(default)]
     pub ratelimit: RateLimitCfg,
+    /// HDD 适配模式（默认 false）：关闭 mmap、≥1MiB 顺序读、对文件发 SEQUENTIAL 预读提示
+    #[serde(default)]
+    pub hdd_mode: bool,
+    /// 小文件内存缓存预算（MiB；0=关闭，默认关闭）
+    #[serde(default)]
+    pub small_cache_mb: usize,
+    /// 可缓存的单文件上限（KiB）
+    #[serde(default = "default_small_cache_max_kb")]
+    pub small_cache_max_kb: usize,
+    /// 应用层防护
+    #[serde(default)]
+    pub defense: DefenseCfg,
     /// 自定义错误页："404"/"4xx"/"5xx"/"default" -> wwwroot 相对路径；
     /// 页内支持 {{code}}/{{message}} 与 {code}/{message} 动态占位符
     #[serde(default)]
@@ -579,6 +629,25 @@ impl Config {
             validate_rewrite(&format!("rewrites[{i}]"), w).map_err(|e| anyhow::anyhow!(e))?;
         }
         validate_ratelimit("ratelimit", &self.ratelimit, true).map_err(|e| anyhow::anyhow!(e))?;
+        // v0.4.1 性能/防护参数
+        if self.small_cache_mb > 4096 {
+            return Err(anyhow::anyhow!("small_cache_mb 须在 0..=4096"));
+        }
+        if self.small_cache_max_kb == 0 || self.small_cache_max_kb > 4096 {
+            return Err(anyhow::anyhow!("small_cache_max_kb 须在 1..=4096"));
+        }
+        if self.defense.max_header_kb < 8 || self.defense.max_header_kb > 1024 {
+            return Err(anyhow::anyhow!("defense.max_header_kb 须在 8..=1024"));
+        }
+        if self.defense.violation_window_secs == 0 || self.defense.violation_window_secs > 86400 {
+            return Err(anyhow::anyhow!("defense.violation_window_secs 须在 1..=86400"));
+        }
+        if self.defense.ban_secs == 0 || self.defense.ban_secs > 86400 {
+            return Err(anyhow::anyhow!("defense.ban_secs 须在 1..=86400"));
+        }
+        if self.defense.max_conn_per_ip > 100_000 {
+            return Err(anyhow::anyhow!("defense.max_conn_per_ip 过大（>100000）"));
+        }
         Ok(())
     }
 }

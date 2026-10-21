@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -37,6 +37,16 @@ pub async fn run(material: Arc<ArcSwap<Material>>, addr: SocketAddr) -> anyhow::
                 continue;
             }
         };
+        // 每 IP 并发连接限制（应用层 CC 缓解）
+        let def = material.load_full().defense.clone();
+        let conn_guard = match def.acquire_conn(Some(peer.ip())) {
+            Some(g) => g,
+            None => {
+                log_warn!("每 IP 并发连接超限，直接断开 {peer}");
+                drop(sock);
+                continue;
+            }
+        };
         // 并发上限：容量不足时在此等待（内核队列兜底），不会无限膨胀任务
         let permit = match sem.clone().acquire_owned().await {
             Ok(p) => p,
@@ -45,6 +55,7 @@ pub async fn run(material: Arc<ArcSwap<Material>>, addr: SocketAddr) -> anyhow::
         let material = material.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _conn_guard = conn_guard;
             conn_task(material, sock, peer).await;
         });
     }
@@ -86,13 +97,40 @@ async fn serve<I>(material: Arc<ArcSwap<Material>>, io: TokioIo<I>, peer: Socket
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let (max_req, max_hdr_kb) = {
+        let m = material.load_full();
+        (m.cfg.defense.max_requests_per_conn, m.cfg.defense.max_header_kb.max(8))
+    };
     let mut builder = Builder::new(TokioExecutor::new());
     builder
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(Some(Duration::from_secs(30)))
+        .max_buf_size(max_hdr_kb * 1024)
         .keep_alive(true);
-    let svc = service_fn(move |req| handle(material.clone(), req, peer, tls));
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let svc = {
+        let material = material.clone();
+        let counter = req_count.clone();
+        service_fn(move |req| {
+            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let material = material.clone();
+            async move {
+                match handle(material, req, peer, tls).await {
+                    Ok(mut resp) => {
+                        if max_req > 0 && n >= max_req {
+                            resp.headers_mut().insert(
+                                http::header::CONNECTION,
+                                http::HeaderValue::from_static("close"),
+                            );
+                        }
+                        Ok(resp)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        })
+    };
     if let Err(e) = builder.serve_connection(io, svc).await {
         log_debug!("连接 {peer} 结束: {e}");
     }
@@ -274,12 +312,20 @@ impl HyperResponder {
         len: u64,
         chunk: usize,
         use_mmap: bool,
+        sequential: bool,
         window_size: usize,
     ) -> crate::core::BoxFut<'_, Result<(), String>> {
         use std::io::Seek as _;
         let shared = self.file.clone();
         Box::pin(async move {
             let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            if sequential {
+                use std::os::unix::io::AsRawFd;
+                unsafe {
+                    libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+                }
+            }
             if start > 0 {
                 f.seek(std::io::SeekFrom::Start(start)).map_err(|e| e.to_string())?;
             }
@@ -354,9 +400,10 @@ impl Responder for HyperResponder {
         len: u64,
         chunk: usize,
         use_mmap: bool,
+        sequential: bool,
         window_size: usize,
     ) -> crate::core::BoxFut<'_, Result<(), String>> {
-        self.file_sender(path.to_path_buf(), start, len, chunk, use_mmap, window_size)
+        self.file_sender(path.to_path_buf(), start, len, chunk, use_mmap, sequential, window_size)
     }
     fn finish(&mut self) -> crate::core::BoxFut<'_, Result<(), String>> {
         self.tx.take();

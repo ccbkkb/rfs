@@ -1,0 +1,24 @@
+# v0.4.1 性能/防护测试配置（端口 18085）
+# 注意：根级裸键必须写在任何 [表] 之前（TOML 规则）
+listen = "127.0.0.1"
+port = 18085
+wwwroot = "./www"
+
+hdd_mode = true
+small_cache_mb = 1
+small_cache_max_kb = 64
+
+[auth]
+mode = "none"
+
+[defense]
+enable = true
+max_conn_per_ip = 8
+max_violations = 5
+violation_window_secs = 30
+ban_secs = 60
+max_header_kb = 64
+max_requests_per_conn = 1000
+
+log_level = "info"
+access_log = true

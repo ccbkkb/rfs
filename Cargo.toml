@@ -1,6 +1,6 @@
 [package]
 name = "rfs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "rfs - 轻量级、可平替 nginx 的 Rust 静态文件服务器（HTTP/1.1+HTTP/2+HTTP/3，鉴权、虚拟主机、热重载）"
 license = "MIT"

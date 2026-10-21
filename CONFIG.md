@@ -449,3 +449,28 @@ v0.2.0 的大文件零拷贝优化（默认开）。若你的文件目录在 NFS
 - 429 响应携带 `Retry-After`；IPv6 按 /64 聚合（防换后缀绕过）；
 - vhost 级 `[vhosts."x".ratelimit]` 可覆盖 `rate`/`burst`（设 0 关闭该站限速）；
 - 限速在鉴权之前执行（抵御口令爆破）；桶状态在进程内共享、热重载不丢失。
+
+## 11. 性能与应用层防护（v0.4.1）
+
+### 11.1 性能
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `hdd_mode` | 布尔 | false | HDD 适配：关闭 mmap、读块 ≥1MiB、发 `POSIX_FADV_SEQUENTIAL` 预读提示 |
+| `small_cache_mb` | 整数 | 0 | 小文件内存缓存预算（MiB）；0=关闭 |
+| `small_cache_max_kb` | 整数 | 64 | 可缓存的单文件上限（KiB，1..=4096） |
+
+启用小文件缓存后，命中/未命中会在响应头 `x-rfs-cache: hit|miss` 中体现；缓存按字节预算 FIFO 淘汰，mtime/长度变化自动失效。
+
+### 11.2 应用层防护 `[defense]`（默认开启）
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `enable` | 布尔 | true | 总开关 |
+| `max_conn_per_ip` | 整数 | 96 | 每 IP 并发连接上限（0=不限）；超出直接断开新连接 |
+| `max_violations` | 整数 | 30 | 窗口内违规（路径穿越/NUL/非法编码等）次数 → 临时封禁 |
+| `violation_window_secs` | 整数 | 60 | 违规统计窗口（1..=86400） |
+| `ban_secs` | 整数 | 300 | 封禁时长（1..=86400） |
+| `max_header_kb` | 整数 | 64 | HTTP/1 头部缓冲上限（8..=1024），防超大头部攻击 |
+| `max_requests_per_conn` | 整数 | 1000 | 单连接最大请求数，超出回 `Connection: close`（0=不限） |
+
+配合已有的 `[ratelimit]`（请求速率）与 `max_conn`（全局并发）形成三层应用层缓解。
+注：Onion 场景下客户端 IP 均为 127.0.0.1，无法按 IP 区分；但 Onion 部署使用独立 Python 服务，不经过 rfs。
