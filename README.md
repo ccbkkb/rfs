@@ -17,6 +17,9 @@
 | 反向代理 (v0.4) | 前缀路由 → http/https 上游；请求/响应双向流式；逐跳头剥离；XFF 防伪造；头注入/移除；连接 5s、整体超时可配 |
 | 伪静态/重写 (v0.4) | 正则重写（rust regex 线性时间，无 ReDoS）→ 内部重写或 301/302/307/308；结果强制内部路径（防开放重定向）；重写链最多 8 跳 |
 | 速率限制 (v0.4) | 令牌桶；默认文件持久化（重启保留），可选 Redis 固定窗口；IPv6 /64 聚合；429 + Retry-After；桶表有硬上限（防 OOM） |
+| 小文件缓存 (v0.4.1) | 可选内存缓存（`small_cache_mb`，默认关闭）；≤64KiB 热点文件零磁盘读；字节预算硬上限（防 OOM） |
+| HDD 模式 (v0.4.1) | `hdd_mode=true`（默认关）：关闭 mmap、≥1MiB 顺序读、`posix_fadvise(SEQUENTIAL)` 预读提示 |
+| 应用层防护 (v0.4.1) | 每 IP 并发连接上限、违规（穿越/NUL）计数临时封禁、HTTP/1 头部缓冲上限、单连接请求数上限 |
 | 低调空闲 | 纯事件驱动异步运行时，空闲时不轮询不忙等 |
 
 ## 快速开始
@@ -99,6 +102,25 @@ max_entries = 65536               # 内存桶表上限（防 OOM）
 ```
 
 安全要点：上游地址只来自配置（非请求参数，无 SSRF 面）；转发路径重建并做 URI 安全编码；`..` 先归一化再转发；剥离全部逐跳头；XFF 可覆盖防伪造；重写/跳转结果必须是内部路径；全链路流式 + 有界通道（内存与请求大小无关）；代理写请求同样遵循 `require_auth_write` 与站点鉴权。
+
+### v0.4.1：性能调优与应用层防护（新增）
+
+```toml
+hdd_mode = false            # HDD 适配开关（默认关）：关 mmap + ≥1MiB 顺序读 + SEQUENTIAL 预读
+small_cache_mb = 0          # 小文件内存缓存预算（MiB，0=关闭）；建议 16–64
+small_cache_max_kb = 64     # 可缓存的单文件上限
+
+[defense]
+enable = true               # 应用层防护总开关
+max_conn_per_ip = 96        # 每 IP 并发连接上限（0=不限）
+max_violations = 30         # 窗口内违规次数达到阈值 → 临时封禁
+violation_window_secs = 60
+ban_secs = 300
+max_header_kb = 64          # HTTP/1 头部缓冲上限（防超大头部）
+max_requests_per_conn = 1000 # 单连接最大请求数（超出回 Connection: close；0=不限）
+```
+
+可观测：启用小文件缓存后，响应头会带 `x-rfs-cache: hit|miss`（调试/验证用）。
 
 ## API 用法（curl 示例）
 
@@ -191,6 +213,7 @@ src/
 cargo test          # 单元测试（路径归一化 / Range / 路由 / 限速）
 sh runsrv.sh start && sh e2e.sh     # 端到端（明文 + TLS/H3 双实例，42 项断言）
 sh e2e-proxy.sh                     # 反代 / 伪静态 / 限速（27 项断言）
+sh e2e-defense.sh                   # 小文件缓存 / HDD 模式 / 违规封禁（14 项断言）
 ```
 
 实测结果（Android/Termux, aarch64）：

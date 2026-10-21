@@ -34,10 +34,12 @@ pub trait Responder: Send {
         len: u64,
         chunk: usize,
         use_mmap: bool,
+        sequential: bool,
         _window_size: usize,
     ) -> BoxFut<'_, Result<(), String>> {
         // H3 默认实现：tokio 同步读流式（H3 已用 QUIC 流控反压，无需 mmap）
         let _ = use_mmap;
+        let _ = sequential;
         let p = path.to_path_buf();
         Box::pin(async move { stream_file_to(&p, start, len, chunk, self).await })
     }
@@ -230,6 +232,20 @@ pub async fn process<B: ReadBody + 'static, R: Responder>(
     };
     let site = &*site;
 
+    // 应用层封禁检查（路径穿越爆破达到阈值后临时拒绝）
+    if material.defense.is_banned(ctx.peer_ip) {
+        let body = Bytes::from_static(b"403 Forbidden\n");
+        let mut out = vec![
+            ("content-type".into(), "text/plain; charset=utf-8".into()),
+            ("content-length".into(), body.len().to_string()),
+        ];
+        sec_headers(cfg, ctx.tls, &mut out);
+        resp.headers(403, out).await.map_err(|_| ())?;
+        resp.send_body(body.clone()).await.map_err(|_| ())?;
+        resp.finish().await.map_err(|_| ())?;
+        return Ok(Outcome { bytes_sent: body.len() as u64 });
+    }
+
     // 速率限制（在鉴权前执行，抵御口令爆破与枚举；429 带 Retry-After）
     if let Some(policy) = &site.ratelimit {
         if let Err(retry) = material.ratelimit.check(policy, ctx.peer_ip).await {
@@ -260,7 +276,12 @@ pub async fn process<B: ReadBody + 'static, R: Responder>(
     // 路径归一化（防目录穿越）
     let mut rel = match fsops::normalize_path(&ctx.raw_path) {
         Ok(r) => r,
-        Err(e) => return send_error(material, resp, e, ctx).await,
+        Err(e) => {
+            if matches!(e, FsError::Forbidden(_) | FsError::BadRequest(_)) {
+                material.defense.record_violation(ctx.peer_ip);
+            }
+            return send_error(material, resp, e, ctx).await;
+        }
     };
 
     // 伪静态/重写（内部重写可链式，最多 8 跳；结果必须是合法内部路径）
@@ -400,7 +421,7 @@ async fn do_get<R: Responder>(
             let p = path.join(idx);
             if let Ok(m) = tokio::fs::metadata(&p).await {
                 if m.is_file() {
-                    return serve_file(cfg, site, &p, &m, ctx, resp, head_only).await;
+                    return serve_file(material, cfg, site, &p, &m, ctx, resp, head_only).await;
                 }
             }
         }
@@ -447,10 +468,11 @@ async fn do_get<R: Responder>(
         return Ok(Outcome { bytes_sent: if head_only { 0 } else { len } });
     }
 
-    serve_file(cfg, site, path, &meta, ctx, resp, head_only).await
+    serve_file(material, cfg, site, path, &meta, ctx, resp, head_only).await
 }
 
 async fn serve_file<R: Responder>(
+    material: &crate::material::Material,
     cfg: &Config,
     site: &Site,
     path: &std::path::Path,
@@ -507,6 +529,34 @@ async fn serve_file<R: Responder>(
     }
 
     let body_len = if len == 0 { 0 } else { end - start + 1 };
+
+    // 小文件内存缓存（仅整文件 GET/HEAD；Range 不缓存）
+    let mut cache_state: Option<&'static str> = None;
+    let mut cache_data: Option<Bytes> = None;
+    if status == 200
+        && !head_only
+        && len > 0
+        && cfg.small_cache_mb > 0
+        && len <= (cfg.small_cache_max_kb * 1024) as u64
+    {
+        match material.small_cache.get(path, mtime_ns, len) {
+            Some(b) => {
+                cache_state = Some("hit");
+                cache_data = Some(b);
+            }
+            None => {
+                if let Ok(v) = tokio::fs::read(path).await {
+                    if v.len() as u64 == len {
+                        let b = Bytes::from(v);
+                        material.small_cache.put(path, mtime_ns, len, b.clone());
+                        cache_state = Some("miss");
+                        cache_data = Some(b);
+                    }
+                }
+            }
+        }
+    }
+
     let mut out = vec![
         ("content-type".into(), mime_guess(path).into()),
         ("content-length".into(), body_len.to_string()),
@@ -518,6 +568,9 @@ async fn serve_file<R: Responder>(
     if let Some(cr) = content_range {
         out.push(("content-range".into(), cr));
     }
+    if let Some(st) = cache_state {
+        out.push(("x-rfs-cache".into(), st.into()));
+    }
     sec_headers(cfg, ctx.tls, &mut out);
     resp.headers(status, out).await.map_err(|_| ())?;
 
@@ -526,16 +579,29 @@ async fn serve_file<R: Responder>(
         return Ok(Outcome::default());
     }
 
+    if let Some(bytes) = cache_data {
+        resp.send_body(bytes).await.map_err(|_| ())?;
+        resp.finish().await.map_err(|_| ())?;
+        return Ok(Outcome { bytes_sent: body_len });
+    }
+
     // 流式发送：转交响应层按需读取（内存恒定；HTTP/1.x 不再经过有界通道）
-    // 大文件（>=1MiB）且开启 mmap 时，HTTP/1.x 走分段 mmap 零拷贝窗口
-    let use_mmap = cfg.mmap_send && body_len >= 1024 * 1024;
+    // 大文件（>=1MiB）且开启 mmap 且非 HDD 模式时，HTTP/1.x 走分段 mmap 零拷贝窗口
+    // HDD 模式：关闭 mmap、改用 ≥1MiB 大块顺序读，并给文件发 SEQUENTIAL 预读提示
+    let use_mmap = cfg.mmap_send && !cfg.hdd_mode && body_len >= 1024 * 1024;
+    let chunk = if cfg.hdd_mode {
+        site.io_chunk_size.max(1024 * 1024)
+    } else {
+        site.io_chunk_size.max(4096)
+    };
     resp
         .send_file(
             path,
             start,
             body_len,
-            site.io_chunk_size.max(4096),
+            chunk,
             use_mmap,
+            cfg.hdd_mode,
             cfg.mmap_window_mb * 1024 * 1024,
         )
         .await

@@ -3,8 +3,10 @@
 //! 热重载：kill -HUP <pid>（配置/证书原子切换，失败保留旧配置），或配置 auto_reload=true
 
 mod auth;
+mod cache;
 mod config;
 mod core;
+mod defense;
 mod fsops;
 mod h3srv;
 mod httpd;
@@ -266,7 +268,7 @@ async fn main() {
     if args.check {
         let m = material.load_full();
         println!(
-            "配置校验通过: {}\n  HTTP: {}:{}  wwwroot={}  TLS={}  H3={}  vhosts={}\n  max_conn={} chunk={} legs={} auth={} csrf={} routes={} rewrites={} rl={}",
+            "配置校验通过: {}\n  HTTP: {}:{}  wwwroot={}  TLS={}  H3={}  vhosts={}\n  max_conn={} chunk={} legs={} auth={} csrf={} routes={} rewrites={} rl={} hdd={} cache={}MB def={}",
             args.config_path,
             m.cfg.listen,
             m.cfg.port,
@@ -281,7 +283,10 @@ async fn main() {
             m.cfg.security.csrf,
             m.cfg.routes.len(),
             m.cfg.rewrites.len(),
-            m.cfg.ratelimit.storage
+            m.cfg.ratelimit.storage,
+            m.cfg.hdd_mode,
+            m.cfg.small_cache_mb,
+            m.cfg.defense.enable
         );
         return;
     }
