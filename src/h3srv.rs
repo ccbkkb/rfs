@@ -207,6 +207,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 }
 
 async fn h3_conn(material: Arc<ArcSwap<Material>>, conn: quinn::Connection) {
+    let peer_ip = conn.remote_address().ip();
     let mut server = match h3::server::builder()
         .build(h3_quinn::Connection::new(conn))
         .await
@@ -225,7 +226,7 @@ async fn h3_conn(material: Arc<ArcSwap<Material>>, conn: quinn::Connection) {
                 let material = material.clone();
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
-                        Ok((req, stream)) => h3_req(material, req, stream).await,
+                        Ok((req, stream)) => h3_req(material, req, stream, peer_ip).await,
                         Err(e) => log_debug!("HTTP/3 请求解析失败: {e}"),
                     }
                 });
@@ -245,7 +246,12 @@ async fn h3_conn(material: Arc<ArcSwap<Material>>, conn: quinn::Connection) {
     }
 }
 
-async fn h3_req(material: Arc<ArcSwap<Material>>, req: http::Request<()>, stream: H3Stream) {
+async fn h3_req(
+    material: Arc<ArcSwap<Material>>,
+    req: http::Request<()>,
+    stream: H3Stream,
+    peer_ip: std::net::IpAddr,
+) {
     let start = Instant::now();
     let m = material.load();
     let method = req.method().clone();
@@ -267,6 +273,7 @@ async fn h3_req(material: Arc<ArcSwap<Material>>, req: http::Request<()>, stream
             .unwrap_or_else(|| raw_path.clone()),
         host: host.clone(),
         headers: req.headers().clone(),
+        peer_ip: Some(peer_ip),
         tls: true,
     };
 
@@ -286,9 +293,9 @@ async fn h3_req(material: Arc<ArcSwap<Material>>, req: http::Request<()>, stream
         headers: Vec::new(),
         custom,
     };
-    let mut body_in = H3BodyIn { shared: shared.clone(), done: false };
+    let body_in = H3BodyIn { shared: shared.clone(), done: false };
 
-    let outcome = core::process(&m, &ctx, Some(&mut body_in), &mut responder).await;
+    let outcome = core::process(&m, &ctx, Some(body_in), &mut responder).await;
     let status = responder.status;
     let bytes = outcome.map(|o| o.bytes_sent).unwrap_or(0);
     crate::log::access(

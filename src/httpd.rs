@@ -125,12 +125,13 @@ async fn handle(
             .unwrap_or_else(|| raw_path.clone()),
         host: host.clone(),
         headers: req.headers().clone(),
+        peer_ip: Some(peer.ip()),
         tls,
     };
 
     let (mut responder, body) = HyperResponder::new();
-    let mut body_in = HyperBodyIn::new(req.into_body());
-    let outcome = core::process(&m, &ctx, Some(&mut body_in), &mut responder).await;
+    let body_in = HyperBodyIn::new(req.into_body());
+    let outcome = core::process(&m, &ctx, Some(body_in), &mut responder).await;
     let status = responder.status();
     let bytes = outcome.map(|o| o.bytes_sent).unwrap_or(0);
 

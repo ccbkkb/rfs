@@ -1,10 +1,12 @@
 //! 配置解析与校验
 //! 支持 TOML 格式；启动时读取，SIGHUP 热重载（校验失败则保留旧配置）。
 use crate::fsops;
+use http::Uri;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// 校验自定义响应头：键须为合法 HTTP 头名（token），值不得含 CR/LF/NUL（防 CRLF 注入）
 fn validate_headers(h: &HashMap<String, String>) -> Result<(), String> {
@@ -103,6 +105,238 @@ impl Default for SecurityCfg {
     }
 }
 
+// ---------------- 反向代理 / 伪静态 / 限速（v0.4） ----------------
+
+fn default_proxy_timeout() -> u64 {
+    30
+}
+fn default_xff() -> String {
+    "set".to_string()
+}
+fn default_rl_storage() -> String {
+    "file".to_string()
+}
+fn default_rl_file() -> String {
+    "./rfs-rate.db".to_string()
+}
+fn default_rl_flush() -> u64 {
+    10
+}
+fn default_redis_addr() -> String {
+    "127.0.0.1:6379".to_string()
+}
+fn default_redis_prefix() -> String {
+    "rfs:rl:".to_string()
+}
+fn default_redis_timeout() -> u64 {
+    300
+}
+fn default_rl_max_entries() -> usize {
+    65536
+}
+
+/// 反向代理路由：路径前缀匹配 `prefix` → 转发到 `upstream`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProxyRouteCfg {
+    /// 匹配前缀（须以 '/' 开头；边界按路径段对齐，/api 不会匹配 /api2）
+    pub prefix: String,
+    /// 上游地址：http(s)://host[:port][/base]
+    pub upstream: String,
+    /// 去掉 prefix 后再拼接上游路径
+    pub strip_prefix: bool,
+    /// 保留原始 Host 请求头传给上游（默认 true）
+    #[serde(default = "default_true")]
+    pub preserve_host: bool,
+    /// 校验上游 TLS 证书（默认 true；false 仅用于自签内部后端，风险自负）
+    #[serde(default = "default_true")]
+    pub tls_verify: bool,
+    /// 上游请求总超时（秒）
+    #[serde(default = "default_proxy_timeout")]
+    pub timeout: u64,
+    /// 追加/覆盖发给上游的请求头
+    #[serde(default)]
+    pub set_request_headers: HashMap<String, String>,
+    /// 追加/覆盖回给客户端的响应头
+    #[serde(default)]
+    pub set_response_headers: HashMap<String, String>,
+    /// 从上游响应中移除的头（如 "set-cookie"）
+    #[serde(default)]
+    pub remove_response_headers: Vec<String>,
+    /// X-Forwarded-For 处理：set（覆盖）| append（追加）| off
+    #[serde(default = "default_xff")]
+    pub xff: String,
+}
+
+impl Default for ProxyRouteCfg {
+    fn default() -> Self {
+        ProxyRouteCfg {
+            prefix: String::new(),
+            upstream: String::new(),
+            strip_prefix: false,
+            preserve_host: true,
+            tls_verify: true,
+            timeout: default_proxy_timeout(),
+            set_request_headers: HashMap::new(),
+            set_response_headers: HashMap::new(),
+            remove_response_headers: Vec::new(),
+            xff: default_xff(),
+        }
+    }
+}
+
+/// 伪静态/重写：对路径做正则替换（结果必须是 '/' 开头的内部路径，防开放重定向）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RewriteCfg {
+    /// 正则（建议 ^ 锚定；rust regex 为线性时间，无 ReDoS）
+    pub pattern: String,
+    /// 替换串，支持 $1 等捕获引用
+    pub replace: String,
+    /// 内部重写时保留原查询串；跳转时附加原查询串
+    #[serde(default = "default_true")]
+    pub keep_query: bool,
+    /// 0 = 内部重写；301/302/307/308 = 对外跳转
+    pub redirect: u16,
+}
+
+impl Default for RewriteCfg {
+    fn default() -> Self {
+        RewriteCfg { pattern: String::new(), replace: String::new(), keep_query: true, redirect: 0 }
+    }
+}
+
+/// 速率限制：rate/burst 可在站点级覆盖；storage 等后端设置仅全局生效
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RateLimitCfg {
+    /// 补充速率（req/s）；与 burst 同时 >0 时启用
+    pub rate: Option<f64>,
+    /// 桶容量（突发上限）
+    pub burst: Option<f64>,
+    /// file | redis
+    #[serde(default = "default_rl_storage")]
+    pub storage: String,
+    #[serde(default = "default_rl_file")]
+    pub file: String,
+    #[serde(default = "default_rl_flush")]
+    pub flush_secs: u64,
+    #[serde(default = "default_redis_addr")]
+    pub redis_addr: String,
+    #[serde(default = "default_redis_prefix")]
+    pub redis_prefix: String,
+    #[serde(default = "default_redis_timeout")]
+    pub redis_timeout_ms: u64,
+    /// 后端故障时是否放行（默认 true；安全性要求高可设 false = 故障时拒绝）
+    #[serde(default = "default_true")]
+    pub fail_open: bool,
+    /// 内存中桶表上限（防大量源 IP 导致 OOM）
+    #[serde(default = "default_rl_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for RateLimitCfg {
+    fn default() -> Self {
+        RateLimitCfg {
+            rate: None,
+            burst: None,
+            storage: default_rl_storage(),
+            file: default_rl_file(),
+            flush_secs: default_rl_flush(),
+            redis_addr: default_redis_addr(),
+            redis_prefix: default_redis_prefix(),
+            redis_timeout_ms: default_redis_timeout(),
+            fail_open: true,
+            max_entries: default_rl_max_entries(),
+        }
+    }
+}
+
+fn header_name_ok(k: &str) -> bool {
+    !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+fn validate_route(who: &str, r: &ProxyRouteCfg) -> Result<(), String> {
+    if r.prefix.is_empty() || !r.prefix.starts_with('/') || r.prefix.len() > 256 {
+        return Err(format!("{who}: prefix 须为 '/' 开头且 ≤256 字节"));
+    }
+    if r.prefix.contains("//") || r.prefix.split('/').any(|s| s == "..") {
+        return Err(format!("{who}: prefix 含非法路径段"));
+    }
+    let uri: Uri = r.upstream.parse().map_err(|e| format!("{who}: upstream 非法: {e}"))?;
+    match uri.scheme_str() {
+        Some("http") | Some("https") => {}
+        _ => return Err(format!("{who}: upstream 仅支持 http/https（当前数据不支持其他方案）")),
+    }
+    let auth_ok = uri
+        .authority()
+        .map(|a| !a.as_str().is_empty() && !a.as_str().contains('@'))
+        .unwrap_or(false);
+    if !auth_ok {
+        return Err(format!("{who}: upstream 缺少主机或含用户信息"));
+    }
+    if !uri.path().is_empty() && !uri.path().starts_with('/') {
+        return Err(format!("{who}: upstream 基路径非法"));
+    }
+    if !matches!(r.xff.as_str(), "set" | "append" | "off") {
+        return Err(format!("{who}: xff 须为 set/append/off"));
+    }
+    if r.timeout == 0 || r.timeout > 600 {
+        return Err(format!("{who}: timeout 须在 1..=600 秒"));
+    }
+    validate_headers(&r.set_request_headers).map_err(|e| format!("{who}: set_request_headers {e}"))?;
+    validate_headers(&r.set_response_headers).map_err(|e| format!("{who}: set_response_headers {e}"))?;
+    for k in &r.remove_response_headers {
+        if !header_name_ok(k) {
+            return Err(format!("{who}: remove_response_headers 含非法头名 {k:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rewrite(who: &str, w: &RewriteCfg) -> Result<(), String> {
+    if w.pattern.is_empty() || w.pattern.len() > 512 {
+        return Err(format!("{who}: pattern 长度须在 1..=512"));
+    }
+    regex::Regex::new(&w.pattern).map_err(|e| format!("{who}: pattern 非法: {e}"))?;
+    if w.replace.len() > 1024
+        || w.replace.contains('\r')
+        || w.replace.contains('\n')
+        || w.replace.contains('\0')
+    {
+        return Err(format!("{who}: replace 非法（过长或含换行/空字节）"));
+    }
+    if !matches!(w.redirect, 0 | 301 | 302 | 307 | 308) {
+        return Err(format!("{who}: redirect 只能为 0/301/302/307/308"));
+    }
+    Ok(())
+}
+
+fn validate_ratelimit(who: &str, r: &RateLimitCfg, global: bool) -> Result<(), String> {
+    for (name, v) in [("rate", r.rate), ("burst", r.burst)] {
+        if let Some(v) = v {
+            if !v.is_finite() || v < 0.0 || v > 1_000_000.0 {
+                return Err(format!("{who}: {name} 须在 0..=1e6"));
+            }
+        }
+    }
+    if global {
+        if !matches!(r.storage.as_str(), "file" | "redis") {
+            return Err(format!("{who}: storage 须为 file/redis"));
+        }
+        if r.flush_secs == 0 || r.flush_secs > 3600 {
+            return Err(format!("{who}: flush_secs 须在 1..=3600"));
+        }
+        if r.max_entries < 1024 || r.max_entries > 2_000_000 {
+            return Err(format!("{who}: max_entries 须在 1024..=2000000"));
+        }
+        if r.redis_timeout_ms == 0 || r.redis_timeout_ms > 5000 {
+            return Err(format!("{who}: redis_timeout_ms 须在 1..=5000"));
+        }
+    }
+    Ok(())
+}
+
 /// 单站点（虚拟主机或默认站点）覆盖项；None 表示继承全局配置
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -118,6 +352,15 @@ pub struct VhostCfg {
     /// vhost 级自定义响应头（覆盖全局）
     #[serde(default)]
     pub custom_headers: Option<HashMap<String, String>>,
+    /// vhost 级反代路由（覆盖全局 routes）
+    #[serde(default)]
+    pub routes: Option<Vec<ProxyRouteCfg>>,
+    /// vhost 级伪静态（覆盖全局 rewrites）
+    #[serde(default)]
+    pub rewrites: Option<Vec<RewriteCfg>>,
+    /// vhost 级限速覆盖（rate/burst）
+    #[serde(default)]
+    pub ratelimit: Option<RateLimitCfg>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -187,6 +430,15 @@ pub struct Config {
     /// 自定义响应头（应用于所有响应，可覆盖默认安全头，如 CDN TTL/CORS）
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
+    /// 全局反代路由（vhost.routes 可整体覆盖）
+    #[serde(default)]
+    pub routes: Vec<ProxyRouteCfg>,
+    /// 全局伪静态重写（vhost.rewrites 可整体覆盖）
+    #[serde(default)]
+    pub rewrites: Vec<RewriteCfg>,
+    /// 速率限制（全局默认 + 存储后端设置）
+    #[serde(default)]
+    pub ratelimit: RateLimitCfg,
     /// 自定义错误页："404"/"4xx"/"5xx"/"default" -> wwwroot 相对路径；
     /// 页内支持 {{code}}/{{message}} 与 {code}/{message} 动态占位符
     #[serde(default)]
@@ -274,6 +526,22 @@ impl Config {
             if let Some(ch) = &v.custom_headers {
                 validate_headers(ch).map_err(|e| anyhow::anyhow!("vhost {host} {e}"))?;
             }
+            if let Some(rs) = &v.routes {
+                for (i, r) in rs.iter().enumerate() {
+                    validate_route(&format!("vhost {host} routes[{i}]"), r)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+            }
+            if let Some(ws) = &v.rewrites {
+                for (i, w) in ws.iter().enumerate() {
+                    validate_rewrite(&format!("vhost {host} rewrites[{i}]"), w)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+            }
+            if let Some(rl) = &v.ratelimit {
+                validate_ratelimit(&format!("vhost {host} ratelimit"), rl, false)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            }
         }
         if self.force_https && self.tls_cert.is_none() {
             return Err(anyhow::anyhow!("force_https = true 需要同时配置 TLS（tls_cert/tls_key）"));
@@ -303,6 +571,14 @@ impl Config {
                 return Err(anyhow::anyhow!("error_pages[{k}] 路径非法: {v:?}"));
             }
         }
+        // 全局反代/伪静态/限速校验
+        for (i, r) in self.routes.iter().enumerate() {
+            validate_route(&format!("routes[{i}]"), r).map_err(|e| anyhow::anyhow!(e))?;
+        }
+        for (i, w) in self.rewrites.iter().enumerate() {
+            validate_rewrite(&format!("rewrites[{i}]"), w).map_err(|e| anyhow::anyhow!(e))?;
+        }
+        validate_ratelimit("ratelimit", &self.ratelimit, true).map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
 }
@@ -325,6 +601,12 @@ pub struct Site {
     pub io_chunk_size: usize,
     pub body_idle_timeout: u64,
     pub max_listing: usize,
+    /// 反代路由（已编译；按配置顺序前缀匹配）
+    pub routes: Arc<Vec<Route>>,
+    /// 伪静态重写（已编译）
+    pub rewrites: Arc<Vec<Rewrite>>,
+    /// 生效的限速策略（None = 关闭）
+    pub ratelimit: Option<LimitPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +664,9 @@ impl Site {
                         io_chunk_size: global.io_chunk_size,
                         body_idle_timeout: global.body_idle_timeout,
                         max_listing: global.max_listing,
+                        routes: Arc::new(Vec::new()),
+                        rewrites: Arc::new(Vec::new()),
+                        ratelimit: None,
                     },
                 )
             }
@@ -401,8 +686,182 @@ impl Site {
                     io_chunk_size: global.io_chunk_size,
                     body_idle_timeout: global.body_idle_timeout,
                     max_listing: global.max_listing,
+                    routes: Arc::new(Vec::new()),
+                    rewrites: Arc::new(Vec::new()),
+                    ratelimit: None,
                 },
             ),
         }
     }
+}
+
+// ---------------- 运行期编译物：路由 / 重写 / 限速策略 ----------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XffMode {
+    Set,
+    Append,
+    Off,
+}
+
+/// 已编译的反代路由
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub prefix: String,
+    #[allow(dead_code)] // 保留原始上游 URI（诊断/未来使用）；转发实际用 upstream_base
+    pub upstream: Uri,
+    /// scheme://authority[+base]（无尾 '/'），与路径拼接即最终上游 URL
+    pub upstream_base: String,
+    pub strip_prefix: bool,
+    pub preserve_host: bool,
+    pub tls_verify: bool,
+    pub timeout: Duration,
+    pub set_req: Vec<(String, String)>,
+    pub set_resp: Vec<(String, String)>,
+    /// 小写形式
+    pub remove_resp: Vec<String>,
+    pub xff: XffMode,
+}
+
+impl Route {
+    /// 前缀匹配（按路径段对齐：/api 不匹配 /api2）；返回剩余路径（"" 或 "/..."）
+    pub fn match_rest<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if !path.starts_with(&self.prefix) {
+            return None;
+        }
+        let rest = &path[self.prefix.len()..];
+        if !rest.is_empty() && !rest.starts_with('/') && !self.prefix.ends_with('/') {
+            return None;
+        }
+        Some(rest)
+    }
+
+    /// 计算转发到上游的路径（不含查询串）
+    pub fn forward_path(&self, full_path: &str, rest: &str) -> String {
+        if self.strip_prefix {
+            if rest.is_empty() {
+                "/".to_string()
+            } else if rest.starts_with('/') {
+                rest.to_string()
+            } else {
+                format!("/{rest}")
+            }
+        } else {
+            full_path.to_string()
+        }
+    }
+}
+
+/// 已编译的伪静态规则
+#[derive(Debug, Clone)]
+pub struct Rewrite {
+    pub re: regex::Regex,
+    pub replace: String,
+    pub keep_query: bool,
+    pub redirect: u16,
+}
+
+impl Rewrite {
+    /// 匹配并产生新路径；未匹配（或结果相同）返回 None
+    pub fn apply(&self, path: &str) -> Option<String> {
+        let out = self.re.replace(path, self.replace.as_str());
+        if out.as_ref() == path {
+            None
+        } else {
+            Some(out.into_owned())
+        }
+    }
+}
+
+/// 生效的限速策略（令牌桶：速率 + 突发容量）
+#[derive(Debug, Clone, Copy)]
+pub struct LimitPolicy {
+    pub rate: f64,
+    pub burst: f64,
+}
+
+fn sorted_map(m: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = m.iter().map(|(k, val)| (k.clone(), val.clone())).collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// 编译路由表
+pub fn compile_routes(cfgs: &[ProxyRouteCfg]) -> anyhow::Result<Vec<Route>> {
+    let mut out = Vec::with_capacity(cfgs.len());
+    for (i, r) in cfgs.iter().enumerate() {
+        validate_route(&format!("routes[{i}]"), r).map_err(|e| anyhow::anyhow!(e))?;
+        let uri: Uri = r
+            .upstream
+            .parse()
+            .map_err(|e| anyhow::anyhow!("routes[{i}] upstream 非法: {e}"))?;
+        let mut base = String::new();
+        base.push_str(uri.scheme_str().unwrap_or("http"));
+        base.push_str("://");
+        base.push_str(uri.authority().map(|a| a.as_str()).unwrap_or(""));
+        let bp = uri.path().trim_end_matches('/');
+        if bp != "/" && !bp.is_empty() {
+            base.push_str(bp);
+        }
+        let xff = match r.xff.as_str() {
+            "append" => XffMode::Append,
+            "off" => XffMode::Off,
+            _ => XffMode::Set,
+        };
+        out.push(Route {
+            prefix: r.prefix.clone(),
+            upstream: uri,
+            upstream_base: base,
+            strip_prefix: r.strip_prefix,
+            preserve_host: r.preserve_host,
+            tls_verify: r.tls_verify,
+            timeout: Duration::from_secs(r.timeout),
+            set_req: sorted_map(&r.set_request_headers),
+            set_resp: sorted_map(&r.set_response_headers),
+            remove_resp: r.remove_response_headers.iter().map(|s| s.to_ascii_lowercase()).collect(),
+            xff,
+        });
+    }
+    Ok(out)
+}
+
+/// 编译伪静态规则
+pub fn compile_rewrites(cfgs: &[RewriteCfg]) -> anyhow::Result<Vec<Rewrite>> {
+    let mut out = Vec::with_capacity(cfgs.len());
+    for (i, w) in cfgs.iter().enumerate() {
+        validate_rewrite(&format!("rewrites[{i}]"), w).map_err(|e| anyhow::anyhow!(e))?;
+        let re = regex::Regex::new(&w.pattern)
+            .map_err(|e| anyhow::anyhow!("rewrites[{i}] pattern 非法: {e}"))?;
+        out.push(Rewrite {
+            re,
+            replace: w.replace.clone(),
+            keep_query: w.keep_query,
+            redirect: w.redirect,
+        });
+    }
+    Ok(out)
+}
+
+/// 合成站点限速策略（vhost 覆盖全局的 rate/burst）
+pub fn compile_limit(global: &RateLimitCfg, vhost: Option<&RateLimitCfg>) -> Option<LimitPolicy> {
+    let rate = vhost.and_then(|v| v.rate).or(global.rate)?;
+    let burst = vhost.and_then(|v| v.burst).or(global.burst)?;
+    if rate > 0.0 && burst > 0.0 && rate.is_finite() && burst.is_finite() {
+        Some(LimitPolicy { rate, burst })
+    } else {
+        None
+    }
+}
+
+/// 将全局/vhost 的 routes/rewrites/ratelimit 编译进 Site
+pub fn attach_extras(site: &mut Site, global: &Config, host: Option<&str>) -> anyhow::Result<()> {
+    let v = host
+        .and_then(|h| global.vhosts.get(h))
+        .or_else(|| host.and_then(|h| global.vhosts.get(&h.to_lowercase())));
+    let routes = v.and_then(|v| v.routes.as_deref()).unwrap_or(&global.routes);
+    let rewrites = v.and_then(|v| v.rewrites.as_deref()).unwrap_or(&global.rewrites);
+    site.routes = Arc::new(compile_routes(routes)?);
+    site.rewrites = Arc::new(compile_rewrites(rewrites)?);
+    site.ratelimit = compile_limit(&global.ratelimit, v.and_then(|v| v.ratelimit.as_ref()));
+    Ok(())
 }

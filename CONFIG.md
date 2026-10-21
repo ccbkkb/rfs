@@ -396,3 +396,56 @@ HTTP/3 强制要求 TLS（QUIC 内建 TLS1.3）。先配 `tls_cert`/`tls_key`。
 
 **Q6：mmap_send 是什么？要关吗？**
 v0.2.0 的大文件零拷贝优化（默认开）。若你的文件目录在 NFS 等网络文件系统上、且存在外部截断文件的可能，可设 `mmap_send = false` 回退传统流式；本地盘无需关闭。极端情况下（发送中文件被外部截断）进程会记录日志并以退出码 70 快速退出，请配合 systemd `Restart=always` 或脚本守护。
+
+---
+
+## 8. 反向代理 `[[routes]]`（v0.4）
+
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `prefix` | 字符串 | 必填 | 匹配前缀（'/' 开头、≤256B、按路径段对齐） |
+| `upstream` | 字符串 | 必填 | `http(s)://host[:port][/base]`；仅支持 http/https，禁用户信息 |
+| `strip_prefix` | 布尔 | false | 去掉 prefix 再拼上游路径 |
+| `preserve_host` | 布尔 | true | 保留原始 Host 传给上游 |
+| `tls_verify` | 布尔 | true | 校验上游 TLS 证书；false 仅限自签内网（危险，慎用） |
+| `timeout` | 整数(秒) | 30 | 上游请求（到响应头）超时，1..=600 |
+| `set_request_headers` | 表 | {} | 追加/覆盖发给上游的请求头 |
+| `set_response_headers` | 表 | {} | 追加/覆盖回给客户端的响应头 |
+| `remove_response_headers` | 数组 | [] | 从上游响应中移除的头（如 set-cookie） |
+| `xff` | 字符串 | "set" | X-Forwarded-For：`set`（覆盖，防伪造）/ `append` / `off` |
+
+- 可写在根级（默认站点）或 `[[vhosts."域名".routes]]`（对该 vhost 整体覆盖）；按配置顺序匹配，首个命中即代理；
+- X-Forwarded-Proto/Host、X-Real-IP 自动附加；上游响应默认剥离 `server` 头（由本服务统一输出安全头）；
+- 转发路径先归一化再重建（含 URI 安全编码）：`..` 段不会原样透传给上游；
+- 请求/响应体全流式（有界通道），内存与报文大小无关。
+
+## 9. 伪静态 `[[rewrites]]`（v0.4）
+
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `pattern` | 字符串 | 必填 | rust regex（线性时间，无 ReDoS；建议 ^ 锚定，≤512B） |
+| `replace` | 字符串 | 必填 | 支持 $1.. 捕获引用；结果必须解析为 '/' 开头的内部路径 |
+| `keep_query` | 布尔 | true | 跳转时附加原查询串；内部重写天然保留原查询 |
+| `redirect` | 整数 | 0 | 0=内部重写；301/302/307/308=对外跳转 |
+
+- 内部重写可链式（最多 8 跳防循环）；重写发生在路由匹配之前，可把“伪静态 URL”改写到反代前缀；
+- 跳转 Location 仅限内部路径（防开放重定向）；vhost 级 `[[vhosts."x".rewrites]]` 整体覆盖全局。
+
+## 10. 速率限制 `[ratelimit]`（v0.4）
+
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `rate` | 浮点 | 无 | 每秒补充令牌数（与 burst 同时 >0 才启用） |
+| `burst` | 浮点 | 无 | 桶容量（可容忍的突发请求数） |
+| `storage` | 字符串 | "file" | `file`（默认，重启保留）或 `redis`（固定窗口） |
+| `file` | 路径 | ./rfs-rate.db | 状态文件（tmp+rename 原子写） |
+| `flush_secs` | 整数 | 10 | 落盘间隔（1..=3600） |
+| `redis_addr` | 字符串 | 127.0.0.1:6379 | Redis 地址 |
+| `redis_prefix` | 字符串 | "rfs:rl:" | Redis 键前缀 |
+| `redis_timeout_ms` | 整数 | 300 | Redis 命令超时（1..=5000） |
+| `fail_open` | 布尔 | true | 后端故障时放行（false = 拒绝；安全优先可选 false） |
+| `max_entries` | 整数 | 65536 | 内存桶表上限（1024..=2000000），超限先清扫后拒绝新来源 |
+
+- 429 响应携带 `Retry-After`；IPv6 按 /64 聚合（防换后缀绕过）；
+- vhost 级 `[vhosts."x".ratelimit]` 可覆盖 `rate`/`burst`（设 0 关闭该站限速）；
+- 限速在鉴权之前执行（抵御口令爆破）；桶状态在进程内共享、热重载不丢失。
